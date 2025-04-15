@@ -1,7 +1,6 @@
 package controllers
 
 import (
-	"database/sql"
 	"inventory-app/config"
 	"inventory-app/models"
 	"net/http"
@@ -14,130 +13,176 @@ const LOW_STOCK_THRESHOLD = 5 // configurable threshold for low-stock alerts
 
 // CreateStockTransaction handles adding a new stock transaction and updating inventory summary.
 func CreateStockTransaction(c *gin.Context) {
-	var transaction models.StockTransaction
+    var transaction models.StockTransaction
+    if err := c.ShouldBindJSON(&transaction); err != nil {
+        c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+        return
+    }
 
-	if err := c.ShouldBindJSON(&transaction); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
+    // Basic validation
+    if transaction.Quantity <= 0 {
+        c.JSON(http.StatusBadRequest, gin.H{"error": "Quantity must be greater than 0"})
+        return
+    }
 
-	if transaction.Quantity <= 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Quantity must be greater than 0"})
-		return
-	}
+    if transaction.TransactionType != "in" && transaction.TransactionType != "out" {
+        c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid transaction type"})
+        return
+    }
 
-	if transaction.TransactionType != "in" && transaction.TransactionType != "out" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid transaction type"})
-		return
-	}
+    // For stock-out, verify there's enough stock
+    if transaction.TransactionType == "out" {
+        var currentStock float64
+        err := config.DB.QueryRow(`
+            SELECT ending_stock FROM inventory_summary WHERE product_id = ?
+        `, transaction.ProductID).Scan(&currentStock)
+        
+        if err != nil {
+            c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check current stock: " + err.Error()})
+            return
+        }
+        
+        if currentStock < transaction.Quantity {
+            c.JSON(http.StatusBadRequest, gin.H{"error": "Insufficient stock for this transaction"})
+            return
+        }
+    }
 
-	if transaction.TransactionTimestamp.IsZero() {
-		transaction.TransactionTimestamp = time.Now()
-	}
+    // Set default timestamp if not provided
+    if transaction.TransactionTimestamp.IsZero() {
+        transaction.TransactionTimestamp = time.Now()
+    }
 
-	if transaction.TotalValue == 0 && transaction.PricePerUnit != 0 {
-		transaction.TotalValue = transaction.PricePerUnit * transaction.Quantity
-	}
+    // Auto-calculate total value if needed
+    if transaction.TotalValue == 0 && transaction.PricePerUnit > 0 {
+        transaction.TotalValue = transaction.PricePerUnit * transaction.Quantity
+    }
 
-	stmt, err := config.DB.Prepare(`
-		INSERT INTO stock_transactions
-		(product_id, transaction_type, quantity, price_per_unit, total_value, department, transaction_timestamp, notes)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-	`)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	defer stmt.Close()
+    // Start a transaction for atomicity
+    tx, err := config.DB.Begin()
+    if err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to begin transaction: " + err.Error()})
+        return
+    }
 
-	result, err := stmt.Exec(
-		transaction.ProductID,
-		transaction.TransactionType,
-		transaction.Quantity,
-		transaction.PricePerUnit,
-		transaction.TotalValue,
-		transaction.Department,
-		transaction.TransactionTimestamp,
-		transaction.Notes,
-	)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
+    // Insert the stock transaction
+    stmt, err := tx.Prepare(`
+        INSERT INTO stock_transactions
+        (product_id, transaction_type, quantity, price_per_unit, total_value, department, transaction_timestamp, notes)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `)
+    if err != nil {
+        tx.Rollback()
+        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+        return
+    }
+    defer stmt.Close()
 
-	id, _ := result.LastInsertId()
-	transaction.ID = int(id)
+    result, err := stmt.Exec(
+        transaction.ProductID,
+        transaction.TransactionType,
+        transaction.Quantity,
+        transaction.PricePerUnit,
+        transaction.TotalValue,
+        transaction.Department,
+        transaction.TransactionTimestamp,
+        transaction.Notes,
+    )
+    if err != nil {
+        tx.Rollback()
+        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+        return
+    }
 
-	// --- Inventory Summary Handling ---
-	var (
-		currentIn, currentOut, currentAvg, currentEnding float64
-		openingStock                                      float64
-	)
+    id, _ := result.LastInsertId()
+    transaction.ID = int(id)
 
-	row := config.DB.QueryRow(`
-		SELECT opening_stock, total_in, total_out, average_price, ending_stock 
-		FROM inventory_summary WHERE product_id = ?
-	`, transaction.ProductID)
+    // Get current inventory summary state
+    var (
+        currentIn, currentOut, currentAvg, currentEnding float64
+    )
 
-	err = row.Scan(&openingStock, &currentIn, &currentOut, &currentAvg, &currentEnding)
+    row := tx.QueryRow(`
+        SELECT total_in, total_out, average_price, ending_stock 
+        FROM inventory_summary WHERE product_id = ?
+    `, transaction.ProductID)
 
-	if err == sql.ErrNoRows {
-		// First transaction for this product, initialize summary
-		var stockIn, stockOut, avgPrice, ending float64
-		if transaction.TransactionType == "in" {
-			stockIn = transaction.Quantity
-			avgPrice = transaction.PricePerUnit
-			ending = stockIn
-		} else {
-			stockOut = transaction.Quantity
-			ending = -stockOut
-		}
-		_, err = config.DB.Exec(`
-			INSERT INTO inventory_summary
-			(product_id, opening_stock, total_in, total_out, ending_stock, average_price)
-			VALUES (?, ?, ?, ?, ?, ?)`,
-			transaction.ProductID, 0.0, stockIn, stockOut, ending, avgPrice)
-	} else if err == nil {
-		// Update existing summary
-		newIn := currentIn
-		newOut := currentOut
-		newEnding := currentEnding
-		newAvg := currentAvg
+    err = row.Scan(&currentIn, &currentOut, &currentAvg, &currentEnding)
+    if err != nil {
+        tx.Rollback()
+        c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get current inventory state: " + err.Error()})
+        return
+    }
 
-		if transaction.TransactionType == "in" {
-			newIn += transaction.Quantity
-			newEnding += transaction.Quantity
-			if transaction.PricePerUnit > 0 {
-				newAvg = ((currentAvg * currentIn) + (transaction.PricePerUnit * transaction.Quantity)) / newIn
-			}
-		} else {
-			newOut += transaction.Quantity
-			newEnding -= transaction.Quantity
-		}
+    // Update inventory summary based on transaction type
+    var newIn, newOut, newEnding, newAvg float64
+    newIn = currentIn
+    newOut = currentOut
+    newEnding = currentEnding
+    newAvg = currentAvg
 
-		_, err = config.DB.Exec(`
-			UPDATE inventory_summary
-			SET total_in = ?, total_out = ?, ending_stock = ?, average_price = ?
-			WHERE product_id = ?`,
-			newIn, newOut, newEnding, newAvg, transaction.ProductID)
-	}
+    if transaction.TransactionType == "in" {
+        newIn += transaction.Quantity
+        newEnding += transaction.Quantity
+        
+        // Recalculate average price (weighted average) for stock-in
+        if transaction.PricePerUnit > 0 {
+            // Weighted average calculation
+            totalValueBefore := currentAvg * currentIn
+            totalValueNew := transaction.PricePerUnit * transaction.Quantity
+            if newIn > 0 { // Avoid division by zero
+                newAvg = (totalValueBefore + totalValueNew) / newIn
+            }
+        }
+    } else { // "out"
+        newOut += transaction.Quantity
+        newEnding -= transaction.Quantity
+        // Average price stays the same for stock-out
+    }
 
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed updating inventory summary: " + err.Error()})
-		return
-	}
+    // Update the inventory summary
+    _, err = tx.Exec(`
+        UPDATE inventory_summary
+        SET total_in = ?, total_out = ?, ending_stock = ?, average_price = ?
+        WHERE product_id = ?
+    `, newIn, newOut, newEnding, newAvg, transaction.ProductID)
 
-	// Optional: Low stock alert flag
-	var isLowStock bool
-	if currentEnding-transaction.Quantity <= LOW_STOCK_THRESHOLD && transaction.TransactionType == "out" {
-		isLowStock = true
-	}
+    if err != nil {
+        tx.Rollback()
+        c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update inventory summary: " + err.Error()})
+        return
+    }
 
-	c.JSON(http.StatusCreated, gin.H{
-		"message":        "Transaction recorded successfully",
-		"transaction":    transaction,
-		"low_stock_alert": isLowStock,
-	})
+    // Check if this puts the product in low stock state
+    var lowStockThreshold float64
+    err = tx.QueryRow(`
+        SELECT low_stock_threshold FROM inventory_summary WHERE product_id = ?
+    `, transaction.ProductID).Scan(&lowStockThreshold)
+    
+    if err != nil {
+        tx.Rollback()
+        c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check low stock threshold: " + err.Error()})
+        return
+    }
+    
+    isLowStock := newEnding <= lowStockThreshold
+
+    // Commit the transaction
+    if err := tx.Commit(); err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to commit transaction: " + err.Error()})
+        return
+    }
+
+    c.JSON(http.StatusCreated, gin.H{
+        "message": "Transaction recorded successfully",
+        "transaction": transaction,
+        "inventory_update": gin.H{
+            "previous_stock": currentEnding,
+            "current_stock": newEnding,
+            "average_price": newAvg,
+        },
+        "low_stock_alert": isLowStock,
+    })
 }
 
 // ListStockTransactions retrieves all stock transactions.
